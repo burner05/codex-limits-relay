@@ -4,7 +4,7 @@ Read-only Codex usage feed for the phone dashboard.
 
 ## Flow
 
-1. GitHub Actions runs every 5 minutes (and on manual dispatch).
+1. A Cloudflare Worker Cron Trigger dispatches the GitHub Actions job every 5 minutes.
 2. It decrypts `token.enc` (AES-256-GCM, key in the `TOKEN_KEY` secret).
 3. It reuses the cached access token when possible; otherwise it refreshes the
    Codex OAuth token and writes the new encrypted token.
@@ -52,6 +52,7 @@ git add token.enc && git commit -m "reseed codex token" && git push
 
 ## Freshness
 
-GitHub's scheduled workflows have a 5-minute minimum and can be delayed a few
-minutes. The phone therefore shows Codex data with a small lag, unlike the
+The Cloudflare cron runs every 5 minutes; GitHub can take a few more seconds
+to start the job and Cloudflare KV can take up to a minute to propagate a new
+write. The phone therefore shows Codex data with a small lag, unlike the
 OpenCode data which is fetched every 30 seconds directly from opencode.ai.
