@@ -22,25 +22,27 @@ jobs:
         with:
           node-version: 20
 
-      - name: Refresh token and fetch usage
+      - name: Refresh token, fetch usage, publish
         id: update
         continue-on-error: true
         env:
           TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
+          RELAY_PUBLISH_TOKEN: ${{ secrets.RELAY_PUBLISH_TOKEN }}
+          RELAY_PUBLISH_URL: ${{ vars.RELAY_PUBLISH_URL }}
           CLIENT_ID: app_EMoamEEZ73f0CkXaXp7hrann
         run: node scripts/update.mjs
 
-      - name: Commit usage and rotated token
+      - name: Commit rotated token
         if: always()
         run: |
           git config user.name "codex-limits-bot"
           git config user.email "codex-limits-bot@users.noreply.github.com"
-          git add token.enc usage.json
+          git add token.enc
           if git diff --cached --quiet; then
             echo "no changes"
             exit 0
           fi
-          git commit -m "update codex usage"
+          git commit -m "rotate codex token"
           for attempt in 1 2 3; do
             git pull --rebase origin main || true
             if git push; then

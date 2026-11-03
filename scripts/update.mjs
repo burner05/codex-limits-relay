@@ -4,14 +4,17 @@ import crypto from "node:crypto";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CLIENT_ID = process.env.CLIENT_ID || "app_EMoamEEZ73f0CkXaXp7hrann";
+const PUBLISH_URL = process.env.RELAY_PUBLISH_URL || "";
+const PUBLISH_TOKEN = process.env.RELAY_PUBLISH_TOKEN || "";
 const KEY = Buffer.from(process.env.TOKEN_KEY || "", "base64");
+const REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
 
 if (KEY.length !== 32) {
   console.error("TOKEN_KEY must be 32 bytes, base64 encoded");
   process.exit(2);
 }
 
-function encryptToken(plain) {
+function encrypt(plain) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", KEY, iv);
   const data = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
@@ -23,7 +26,7 @@ function encryptToken(plain) {
   };
 }
 
-function decryptToken() {
+function decrypt() {
   const box = JSON.parse(fs.readFileSync("token.enc", "utf8"));
   const decipher = crypto.createDecipheriv(
     "aes-256-gcm",
@@ -35,6 +38,18 @@ function decryptToken() {
     decipher.update(Buffer.from(box.data, "base64")),
     decipher.final(),
   ]).toString("utf8");
+}
+
+function loadAuth() {
+  const plain = decrypt().trim();
+  if (plain.startsWith("{")) return JSON.parse(plain);
+  // Backwards compatibility with the first version, which stored only the
+  // refresh token as a raw string.
+  return { refresh_token: plain };
+}
+
+function saveAuth(auth) {
+  fs.writeFileSync("token.enc", JSON.stringify(encrypt(JSON.stringify(auth))) + "\n");
 }
 
 function accountIdFromJwt(token) {
@@ -60,14 +75,12 @@ function windowOf(window) {
 async function seed() {
   const refresh = (process.env.REFRESH_TOKEN || "").trim();
   if (!refresh) throw new Error("REFRESH_TOKEN is missing");
-  fs.writeFileSync("token.enc", JSON.stringify(encryptToken(refresh)) + "\n");
+  saveAuth({ refresh_token: refresh });
   console.log("seeded token.enc");
 }
 
-async function update() {
-  let refresh = decryptToken().trim();
-
-  const tokenResponse = await fetch(TOKEN_URL, {
+async function refreshAuth(auth) {
+  const response = await fetch(TOKEN_URL, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -76,41 +89,89 @@ async function update() {
     body: new URLSearchParams({
       grant_type: "refresh_token",
       client_id: CLIENT_ID,
-      refresh_token: refresh,
+      refresh_token: auth.refresh_token,
     }),
   });
-  const tokenText = await tokenResponse.text();
-  if (!tokenResponse.ok) {
-    throw new Error(`refresh HTTP ${tokenResponse.status} ${tokenText.slice(0, 200)}`);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`refresh HTTP ${response.status} ${text.slice(0, 200)}`);
   }
-  const token = JSON.parse(tokenText);
-  refresh = token.refresh_token || refresh;
+  const token = JSON.parse(text);
+  auth.refresh_token = token.refresh_token || auth.refresh_token;
+  auth.access_token = token.access_token;
+  auth.expires_at = Date.now() + Math.max(60, Number(token.expires_in || 3600) - 60) * 1000;
+  saveAuth(auth);
+  console.log("token refreshed, expires_in", token.expires_in);
+  return auth;
+}
 
-  // Persist rotation immediately, before any other network call can fail.
-  fs.writeFileSync("token.enc", JSON.stringify(encryptToken(refresh)) + "\n");
-  console.log("token refreshed");
-
-  const accountId = accountIdFromJwt(token.access_token);
-  if (!accountId) throw new Error("account id missing from access token");
-
-  const usageResponse = await fetch(USAGE_URL, {
+function fetchUsage(accessToken, accountId) {
+  return fetch(USAGE_URL, {
     headers: {
-      "authorization": `Bearer ${token.access_token}`,
+      "authorization": `Bearer ${accessToken}`,
       "chatgpt-account-id": accountId,
       "user-agent": "codex-cli/0.162.1",
       "accept": "application/json",
     },
   });
-  const usageText = await usageResponse.text();
-  if (!usageResponse.ok) {
-    fs.writeFileSync(
-      "usage.json",
-      JSON.stringify({ error: `usage HTTP ${usageResponse.status}`, fetchedAt: Date.now() }, null, 2) + "\n",
-    );
-    throw new Error(`usage HTTP ${usageResponse.status} ${usageText.slice(0, 200)}`);
+}
+
+async function publish(usage) {
+  if (!PUBLISH_URL || !PUBLISH_TOKEN) {
+    console.log("publish target missing; skipping");
+    return;
+  }
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(PUBLISH_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-publish-token": PUBLISH_TOKEN,
+        },
+        body: JSON.stringify(usage),
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(`publish HTTP ${response.status} ${text.slice(0, 160)}`);
+      }
+      console.log("published");
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  throw lastError;
+}
+
+async function update() {
+  let auth = loadAuth();
+  const now = Date.now();
+
+  if (!auth.access_token || !auth.expires_at || auth.expires_at < now + REFRESH_MARGIN_MS) {
+    auth = await refreshAuth(auth);
+  } else {
+    console.log("cached access token still valid");
   }
 
-  const data = JSON.parse(usageText);
+  let accountId = accountIdFromJwt(auth.access_token);
+  let response = await fetchUsage(auth.access_token, accountId);
+
+  if (response.status === 401) {
+    console.log("usage returned 401; refreshing token");
+    auth = await refreshAuth(auth);
+    accountId = accountIdFromJwt(auth.access_token);
+    response = await fetchUsage(auth.access_token, accountId);
+  }
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`usage HTTP ${response.status} ${text.slice(0, 200)}`);
+  }
+
+  const data = JSON.parse(text);
   const rateLimit = data.rate_limit || {};
   const usage = {
     plan: data.plan_type || null,
@@ -118,7 +179,8 @@ async function update() {
     secondary: windowOf(rateLimit.secondary_window),
     fetchedAt: Date.now(),
   };
-  fs.writeFileSync("usage.json", JSON.stringify(usage, null, 2) + "\n");
+
+  await publish(usage);
   console.log("usage", JSON.stringify(usage));
 }
 

@@ -1,25 +1,29 @@
 # Codex Limits Relay
 
-Read-only usage feed for the phone dashboard.
+Read-only Codex usage feed for the phone dashboard.
 
-- A GitHub Actions job runs every 5 minutes.
-- It decrypts the stored Codex refresh token (AES-256-GCM, key in the
-  `TOKEN_KEY` repository secret), refreshes the OAuth token, and fetches
-  `https://chatgpt.com/backend-api/wham/usage`.
-- It writes `usage.json` (only plan, percentages and reset times) and the new
-  encrypted refresh token back to this public repository.
-- The phone reads the data through a small Cloudflare Worker proxy, so the
-  refresh token never leaves GitHub Actions and the public repo contains no
-  account identifiers.
+## Flow
 
-## Secret
+1. GitHub Actions runs every 5 minutes (and on manual dispatch).
+2. It decrypts `token.enc` (AES-256-GCM, key in the `TOKEN_KEY` secret).
+3. It reuses the cached access token when possible; otherwise it refreshes the
+   Codex OAuth token and writes the new encrypted token.
+4. It fetches `https://chatgpt.com/backend-api/wham/usage`.
+5. It pushes the percentages to the Cloudflare Worker (`POST /publish`).
+6. The phone reads `GET /usage` from the Worker.
 
-`TOKEN_KEY`: 32 random bytes, base64 encoded. The token file is public but
-useless without this key.
+The public repository contains only:
 
-## Manual refresh
+- the workflow and a small Node script,
+- an encrypted token file (useless without `TOKEN_KEY`),
+- no account IDs or email addresses.
 
-Run the **update-codex-usage** workflow from the Actions tab.
+## Secrets and variables
+
+- `TOKEN_KEY` (secret): 32 random bytes, base64 encoded.
+- `RELAY_PUBLISH_TOKEN` (secret): shared token for the Worker `/publish`.
+- `RELAY_PUBLISH_URL` (variable): `https://codex-limits-relay.erdibaba3.workers.dev/publish`.
+- `CLIENT_ID` is public (`app_EMoamEEZ73f0CkXaXp7hrann`).
 
 ## Output
 
@@ -28,9 +32,26 @@ Run the **update-codex-usage** workflow from the Actions tab.
   "plan": "plus",
   "primary": { "percent": 2, "resetsAt": 1793688619000, "windowSeconds": 18000 },
   "secondary": { "percent": 18, "resetsAt": 1793784070000, "windowSeconds": 604800 },
-  "fetchedAt": 1793675000000
+  "fetchedAt": 1793675929356
 }
 ```
 
-Codex data is updated on the GitHub Actions schedule (5 minute minimum), so it
-can lag a few minutes behind the OpenCode data.
+## Re-seeding the Codex login
+
+If the refresh token is revoked, create a fresh Codex login (outside the Mac's
+normal `~/.codex`), then replace `token.enc`:
+
+```sh
+CODEX_HOME="$HOME/.codex-relay" codex login --device-auth
+cd codex-limits-relay
+TOKEN_KEY="$(cat ~/.codex-relay/token_key)" \
+REFRESH_TOKEN="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.codex-relay/auth.json")))["tokens"]["refresh_token"])')" \
+node scripts/update.mjs --seed
+git add token.enc && git commit -m "reseed codex token" && git push
+```
+
+## Freshness
+
+GitHub's scheduled workflows have a 5-minute minimum and can be delayed a few
+minutes. The phone therefore shows Codex data with a small lag, unlike the
+OpenCode data which is fetched every 30 seconds directly from opencode.ai.
